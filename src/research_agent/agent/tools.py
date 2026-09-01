@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Annotated
+from typing import Annotated, Literal
 
 from langchain_core.tools import tool
 
 from research_agent.agent.context import get_tool_context
+from research_agent.services.evidence import (
+    evidence_coverage,
+    paper_explanation_requested,
+    paperlens_rejection_reason,
+)
 from research_agent.services.paperlens import PaperLensError, normalize_paperlens_evidence
 from research_agent.services.web import WebAccessError
 
@@ -23,25 +28,51 @@ def _source_for_model(source) -> dict:
 
 async def _search_local_papers_impl(
     query: Annotated[str, "针对已选论文的具体检索问题"],
-    top_k: Annotated[int, "返回证据数量，1 到 10"] = 6,
+    top_k: Annotated[int, "返回候选证据数量，1 到 12"] = 8,
+    search_mode: Annotated[Literal["high_quality", "fast"], "高质量重排或快速混合检索"] = "high_quality",
 ) -> str:
     context = get_tool_context()
-    existing_count = context.database.count_sources(context.run_id, "local_paper")
-    if existing_count >= context.settings.max_local_sources:
-        message = f"已取得 {existing_count} 条论文证据，达到证据数量上限。请停止检索并生成回答。"
-        context.database.add_event(context.run_id, "evidence_sufficient", "local", message)
-        return json.dumps({"error": "evidence_sufficient", "fatal": True, "message": message}, ensure_ascii=False)
-    budget_error = context.use_budget("论文检索", context.settings.max_local_searches)
-    if budget_error:
-        context.database.add_event(context.run_id, "budget_exhausted", "local", budget_error)
-        return json.dumps({"error": "budget_exhausted", "fatal": True, "message": budget_error}, ensure_ascii=False)
+    retrieval_error = context.retrieval_error()
+    if retrieval_error:
+        context.database.add_event(context.run_id, "retrieval_stopped", "local", retrieval_error)
+        return json.dumps({"error": "retrieval_stopped", "fatal": True, "message": retrieval_error}, ensure_ascii=False)
     if not context.document_ids:
         return json.dumps({"error": "本轮没有选择本地论文", "fatal": True}, ensure_ascii=False)
-    if context.database.get_counter(context.run_id, "paperlens_failures") >= 1:
-        message = "PaperLens 本轮请求已经失败，本地检索已熔断。不得重试，请使用已有证据完成回答。"
+    required_aspects = {"overview", "problem", "method", "experiments", "conclusion"}
+    existing_items = [
+        {"section": source.section, "excerpt": source.excerpt}
+        for source in context.database.list_sources(context.run_id)
+        if source.kind == "local_paper"
+    ]
+    existing_coverage = evidence_coverage(existing_items)
+    if (
+        paper_explanation_requested(context.question)
+        and required_aspects.issubset(set(existing_coverage["aspects"]))
+    ):
+        message = "累计证据已覆盖论文的核心问题、方法、实验和结论，无需继续检索。"
+        context.database.add_event(
+            context.run_id, "evidence_sufficient", "local", message, existing_coverage
+        )
+        return json.dumps({
+            "error": "evidence_sufficient",
+            "fatal": True,
+            "message": message,
+            "coverage": existing_coverage,
+        }, ensure_ascii=False)
+    normalized_query = context.normalize_query(query)
+    if not normalized_query:
+        return json.dumps({"error": "检索问题不能为空"}, ensure_ascii=False)
+    if normalized_query in context.seen_local_queries:
+        message = "该论文检索问题本轮已经执行过。请根据尚缺证据提出不同且更具体的问题。"
+        return json.dumps({"error": "duplicate_query", "message": message}, ensure_ascii=False)
+    context.seen_local_queries.add(normalized_query)
+    if context.database.get_counter(context.run_id, "paperlens_failures") >= 2:
+        message = "PaperLens 本轮已连续失败两次，本地检索已熔断。请判断是否改用网页或使用已有证据。"
         context.database.add_event(context.run_id, "circuit_open", "local", message)
         return json.dumps({"error": "paperlens_circuit_open", "fatal": True, "message": message}, ensure_ascii=False)
-    context.database.add_event(context.run_id, "tool_start", "local", f"检索本地论文：{query}", {"query": query})
+    context.database.add_event(context.run_id, "tool_start", "local", f"检索本地论文：{query}", {
+        "query": query, "search_mode": search_mode,
+    })
     async def report_waiting() -> None:
         elapsed = 0
         while True:
@@ -59,7 +90,10 @@ async def _search_local_papers_impl(
     try:
         payload = await asyncio.wait_for(
             context.paperlens.evidence_search(
-                query.strip(), context.document_ids, top_k=max(1, min(top_k, 5))
+                query.strip(),
+                context.document_ids,
+                top_k=max(1, min(top_k, 12)),
+                reranker_mode="local" if search_mode == "high_quality" else "off",
             ),
             timeout=max(0.1, context.remaining_evidence_seconds()),
         )
@@ -72,7 +106,7 @@ async def _search_local_papers_impl(
         context.database.add_event(context.run_id, "tool_error", "local", str(exc))
         return json.dumps({
             "error": "paperlens_unavailable",
-            "fatal": True,
+            "fatal": failures >= 2,
             "message": str(exc),
             "consecutive_failures": failures,
         }, ensure_ascii=False)
@@ -81,9 +115,14 @@ async def _search_local_papers_impl(
         await asyncio.gather(heartbeat, return_exceptions=True)
     context.database.reset_counter(context.run_id, "paperlens_failures")
     sources = []
+    rejected: dict[str, int] = {}
+    accepted_items: list[dict] = []
     for item in payload["evidence"]:
-        if context.database.count_sources(context.run_id, "local_paper") >= context.settings.max_local_sources:
-            break
+        reason = paperlens_rejection_reason(item, query)
+        if reason:
+            rejected[reason] = rejected.get(reason, 0) + 1
+            continue
+        accepted_items.append(item)
         source, created = context.database.add_source(context.run_id, normalize_paperlens_evidence(item))
         sources.append(_source_for_model(source))
         if created:
@@ -94,18 +133,50 @@ async def _search_local_papers_impl(
                 f"找到论文证据 [{source.source_id}] {source.title}",
                 {"source_id": source.source_id, "document_id": source.document_id, "page": source.page},
             )
-    return json.dumps({"query": query, "sources": sources}, ensure_ascii=False)
+    cumulative_items = [
+        {"section": source.section, "excerpt": source.excerpt}
+        for source in context.database.list_sources(context.run_id)
+        if source.kind == "local_paper"
+    ]
+    coverage = evidence_coverage(cumulative_items)
+    explanation_complete = (
+        paper_explanation_requested(context.question)
+        and required_aspects.issubset(set(coverage["aspects"]))
+    )
+    if rejected:
+        context.database.add_event(
+            context.run_id,
+            "evidence_filtered",
+            "local",
+            f"已过滤 {sum(rejected.values())} 条低信息量论文候选",
+            {"reasons": rejected, "query": query},
+        )
+    return json.dumps({
+        "query": query,
+        "sources": sources,
+        "coverage": coverage,
+        "coverage_scope": "本轮累计论文证据",
+        "sufficient_for_question": explanation_complete,
+        "missing_aspects": sorted(required_aspects - set(coverage["aspects"])) if paper_explanation_requested(context.question) else [],
+        "filtered_candidates": rejected,
+        "instruction": (
+            "累计证据已覆盖论文讲解所需关键方面，必须停止检索并返回证据备忘录。"
+            if explanation_complete
+            else "请根据累计 coverage 和用户问题判断证据是否充分；只为 missing_aspects 中的关键缺口继续检索。"
+        ),
+    }, ensure_ascii=False)
 
 
 @tool
 async def search_local_papers(
     query: Annotated[str, "针对已选论文的具体检索问题"],
-    top_k: Annotated[int, "返回证据数量，1 到 10"] = 6,
+    top_k: Annotated[int, "返回候选证据数量，1 到 12"] = 8,
+    search_mode: Annotated[Literal["high_quality", "fast"], "高质量重排或快速混合检索"] = "high_quality",
 ) -> str:
     """Search selected PaperLens documents and return attributed original passages."""
     context = get_tool_context()
     async with context.local_search_lock:
-        return await _search_local_papers_impl(query, top_k)
+        return await _search_local_papers_impl(query, top_k, search_mode)
 
 
 @tool
@@ -115,18 +186,24 @@ async def search_web(
 ) -> str:
     """Search the public web without an API key and return candidate URLs."""
     context = get_tool_context()
-    route_error = context.web_route_error()
-    if route_error:
-        context.database.add_event(context.run_id, "route_stopped", "web", route_error)
-        return json.dumps({"error": "web_not_needed", "fatal": True, "message": route_error}, ensure_ascii=False)
+    permission_error = context.web_permission_error()
+    if permission_error:
+        return json.dumps({"error": "web_not_permitted", "fatal": True, "message": permission_error}, ensure_ascii=False)
+    retrieval_error = context.retrieval_error()
+    if retrieval_error:
+        context.database.add_event(context.run_id, "retrieval_stopped", "web", retrieval_error)
+        return json.dumps({"error": "retrieval_stopped", "fatal": True, "message": retrieval_error}, ensure_ascii=False)
+    normalized_query = context.normalize_query(query)
+    if normalized_query in context.seen_web_queries:
+        return json.dumps({
+            "error": "duplicate_query",
+            "message": "该网页搜索问题本轮已经执行过。请根据证据缺口决定新查询或停止搜索。",
+        }, ensure_ascii=False)
+    context.seen_web_queries.add(normalized_query)
     if context.database.get_counter(context.run_id, "web_search_failures") >= 2:
         message = "DDGS 本轮已连续失败两次，网页搜索已熔断。请使用已有证据完成回答。"
         context.database.add_event(context.run_id, "circuit_open", "web", message)
         return json.dumps({"error": "web_search_circuit_open", "fatal": True, "message": message}, ensure_ascii=False)
-    budget_error = context.use_budget("网页搜索", context.settings.max_web_searches)
-    if budget_error:
-        context.database.add_event(context.run_id, "budget_exhausted", "web", budget_error)
-        return json.dumps({"error": "budget_exhausted", "fatal": True, "message": budget_error}, ensure_ascii=False)
     context.database.add_event(context.run_id, "tool_start", "web", f"搜索公开网页：{query}", {"query": query})
     try:
         results = await asyncio.wait_for(
@@ -160,14 +237,17 @@ async def fetch_web_page(
 ) -> str:
     """Safely fetch a public HTML page and register its extracted text as evidence."""
     context = get_tool_context()
-    route_error = context.web_route_error()
-    if route_error:
-        context.database.add_event(context.run_id, "route_stopped", "web", route_error)
-        return json.dumps({"error": "web_not_needed", "fatal": True, "message": route_error}, ensure_ascii=False)
-    budget_error = context.use_budget("网页抓取", context.settings.max_web_fetches)
-    if budget_error:
-        context.database.add_event(context.run_id, "budget_exhausted", "web", budget_error)
-        return json.dumps({"error": "budget_exhausted", "fatal": True, "message": budget_error}, ensure_ascii=False)
+    permission_error = context.web_permission_error()
+    if permission_error:
+        return json.dumps({"error": "web_not_permitted", "fatal": True, "message": permission_error}, ensure_ascii=False)
+    retrieval_error = context.retrieval_error()
+    if retrieval_error:
+        context.database.add_event(context.run_id, "retrieval_stopped", "web", retrieval_error)
+        return json.dumps({"error": "retrieval_stopped", "fatal": True, "message": retrieval_error}, ensure_ascii=False)
+    normalized_url = url.strip().lower().rstrip("/")
+    if normalized_url in context.seen_web_urls:
+        return json.dumps({"error": "duplicate_url", "message": "该网页本轮已经读取过。"}, ensure_ascii=False)
+    context.seen_web_urls.add(normalized_url)
     context.database.add_event(context.run_id, "tool_start", "web", f"读取网页：{url}", {"url": url})
     try:
         page = await asyncio.wait_for(

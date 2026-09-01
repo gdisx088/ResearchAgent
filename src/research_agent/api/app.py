@@ -181,10 +181,8 @@ def create_app(
             "web": {"available": state.web.search_available, "provider": "DDGS"},
             "persistence": {"available": True},
             "limits": {
-                "local_searches": state.settings.max_local_searches,
-                "web_searches": state.settings.max_web_searches,
-                "web_fetches": state.settings.max_web_fetches,
-                "local_sources": state.settings.max_local_sources,
+                "retrieval_policy": "agent_adaptive",
+                "model_calls_safety_ceiling": state.settings.max_model_calls,
                 "evidence_timeout_seconds": state.settings.evidence_timeout_seconds,
                 "run_timeout_seconds": state.settings.run_timeout_seconds,
             },

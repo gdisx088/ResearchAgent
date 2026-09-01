@@ -51,10 +51,6 @@ class Settings:
     model_name: str
     cors_origins: tuple[str, ...]
     max_model_calls: int
-    max_local_searches: int
-    max_web_searches: int
-    max_web_fetches: int
-    max_local_sources: int
     max_web_bytes: int
     http_timeout_seconds: float
     ddgs_timeout_seconds: float
@@ -85,7 +81,7 @@ def load_settings(*, data_dir: Path | None = None) -> Settings:
         ).split(",")
         if value.strip()
     )
-    paperlens_reranker_mode = os.getenv("PAPERLENS_RERANKER_MODE", "off").strip().lower()
+    paperlens_reranker_mode = os.getenv("PAPERLENS_RERANKER_MODE", "local").strip().lower()
     if paperlens_reranker_mode not in {"local", "off"}:
         raise ValueError("PAPERLENS_RERANKER_MODE must be 'local' or 'off'")
     return Settings(
@@ -100,15 +96,11 @@ def load_settings(*, data_dir: Path | None = None) -> Settings:
         model_api_key=os.getenv("OPENAI_COMPATIBLE_API_KEY", ""),
         model_name=os.getenv("OPENAI_COMPATIBLE_MODEL", "").strip(),
         cors_origins=origins,
-        max_model_calls=_integer("RESEARCH_AGENT_MAX_MODEL_CALLS", 20, maximum=40),
-        max_local_searches=_integer("RESEARCH_AGENT_MAX_LOCAL_SEARCHES", 4, maximum=12),
-        max_web_searches=_integer("RESEARCH_AGENT_MAX_WEB_SEARCHES", 6, maximum=12),
-        max_web_fetches=_integer("RESEARCH_AGENT_MAX_WEB_FETCHES", 8, maximum=20),
-        max_local_sources=_integer("RESEARCH_AGENT_MAX_LOCAL_SOURCES", 10, maximum=30),
+        max_model_calls=_integer("RESEARCH_AGENT_MAX_MODEL_CALLS", 40, maximum=80),
         max_web_bytes=_integer("RESEARCH_AGENT_MAX_WEB_BYTES", 2_000_000, 1024, 10_000_000),
         http_timeout_seconds=_float("RESEARCH_AGENT_HTTP_TIMEOUT_SECONDS", 15),
         ddgs_timeout_seconds=_float("RESEARCH_AGENT_DDGS_TIMEOUT_SECONDS", 20, 3),
-        paperlens_timeout_seconds=_float("PAPERLENS_TIMEOUT_SECONDS", 180),
-        evidence_timeout_seconds=_float("RESEARCH_AGENT_EVIDENCE_TIMEOUT_SECONDS", 180, 30),
-        run_timeout_seconds=_float("RESEARCH_AGENT_RUN_TIMEOUT_SECONDS", 300, 30),
+        paperlens_timeout_seconds=_float("PAPERLENS_TIMEOUT_SECONDS", 300),
+        evidence_timeout_seconds=_float("RESEARCH_AGENT_EVIDENCE_TIMEOUT_SECONDS", 360, 30),
+        run_timeout_seconds=_float("RESEARCH_AGENT_RUN_TIMEOUT_SECONDS", 600, 60),
     )

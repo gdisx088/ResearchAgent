@@ -10,7 +10,8 @@ ResearchAgent 面向论文阅读、研究问题梳理和多来源证据整合场
 
 ## 主要功能
 
-- **多 Agent 研究流程**：主 Agent 负责任务规划与综合，论文、网页和证据审查 Agent 各自承担独立职责。
+- **多 Agent 研究流程**：主 Agent 负责规划和信息源决策，论文、网页、覆盖评估、写作和证据审查 Agent 各自承担独立职责。
+- **自适应检索**：不按固定论文/网页检索次数截断；Agent 根据累计证据覆盖、重复查询、故障和时间预算决定继续或停止。
 - **本地论文证据**：通过 PaperLens 检索论文原文，保留文档、章节、页码、bbox 和检索分数。
 - **无 Key 网页研究**：使用 DDGS 搜索公开网页，并通过 `httpx + trafilatura` 提取正文。
 - **可核验引用**：所有证据先持久化并分配稳定的 `[S1]`、`[S2]` 来源编号，再进入回答。
@@ -25,13 +26,16 @@ ResearchAgent 面向论文阅读、研究问题梳理和多来源证据整合场
 ```mermaid
 flowchart LR
     UI[React 工作台] <-->|REST / SSE| API[FastAPI]
-    API --> MAIN[主 Agent<br/>规划与综合]
+    API --> MAIN[主 Agent<br/>规划与信息源决策]
     MAIN --> LOCAL[论文检索 Agent]
     MAIN --> WEB[网页检索 Agent]
     LOCAL --> PL[PaperLens<br/>解析、索引与页码证据]
     WEB --> DDGS[DDGS]
     WEB --> PAGE[安全网页抓取与正文抽取]
-    MAIN --> CRITIC[证据审查 Agent]
+    MAIN --> COVERAGE[覆盖评估 Agent]
+    COVERAGE -.关键缺口.-> MAIN
+    COVERAGE --> WRITER[独立写作 Agent]
+    WRITER --> CRITIC[证据审查 Agent]
     CRITIC --> VALIDATE[确定性引用校验]
     API --> APPDB[(应用 SQLite)]
     API --> CHECKPOINT[(检查点 SQLite)]
@@ -41,10 +45,11 @@ flowchart LR
 
 1. API 保存研究问题并立即返回任务 ID。
 2. 主 Agent 生成简短计划，并根据问题和所选论文决定信息源。
-3. 子 Agent 获取证据；每条证据经过规范化、去重、编号和持久化。
-4. 主 Agent 使用已保存来源形成带引用草稿。
-5. 证据审查 Agent 进行一次审查，必要时最多修订一次。
-6. 确定性校验移除未知引用，随后一次性发布最终回答。
+3. 子 Agent 自适应获取证据；每条证据经过质量过滤、规范化、去重、编号和持久化。
+4. 覆盖评估 Agent 判断证据是否充分；若仍有关键缺口，主 Agent 自主决定继续论文检索、使用网页或接受当前边界。
+5. 独立写作 Agent 使用筛选后的高质量来源生成正式回答，避免研究日志进入正文。
+6. 证据审查 Agent 进行一次审查，必要时最多修订一次。
+7. 确定性校验清理未知或格式错误的引用，随后一次性发布最终回答。
 
 更详细的内部设计见 [架构说明](docs/ARCHITECTURE.md)。
 
@@ -54,13 +59,13 @@ flowchart LR
 
 | 研究范围 | 实际行为 |
 | --- | --- |
-| 已选择论文，问题只询问论文内容 | 仅检索 PaperLens；已有本地证据后禁止网页搜索 |
-| 已选择论文，并明确要求最新进展、外部资料或跨论文比较 | 同时允许本地论文与公开网页 |
-| 已选择论文，但 PaperLens 失败或达到上限仍无证据 | 在用户允许网页时降级到公开网页 |
-| 未选择论文且允许网页 | 使用公开网页研究 |
+| 已选择论文且允许网页 | 主 Agent 根据问题、论文证据和覆盖缺口，自主判断是否需要网页 |
+| 已选择论文但未允许网页 | 仅使用 PaperLens，自适应补齐与问题相关的论文证据 |
+| PaperLens 连续失败或无有效证据 | 在用户允许时由 Agent 判断是否降级到网页 |
+| 未选择论文且允许网页 | 由 Agent 使用公开网页完成研究 |
 | 未选择论文且未允许网页 | 不进行外部检索，并在回答中说明证据限制 |
 
-检索次数、证据数量和执行时间都有硬上限。并发论文请求会在任务内串行执行，并在获得足够证据后停止，避免重复检索和重试风暴。
+论文搜索、网页搜索和正文抓取不设置固定次数配额。Agent 根据问题所需的语义覆盖自行决定研究深度；完全重复的查询和 URL 会被拒绝，论文请求在任务内串行执行。总证据阶段和整个任务仍保留时间预算，模型调用保留高位安全上限，用于防止异常模型陷入无限循环。
 
 ## 技术栈
 
@@ -160,17 +165,13 @@ OPENAI_COMPATIBLE_MODEL=your-tool-calling-model
 | --- | --- | --- |
 | `PAPERLENS_BASE_URL` | `http://127.0.0.1:8000` | PaperLens 服务地址 |
 | `PAPERLENS_WORKSPACE_ID` | `research-agent` | PaperLens 工作区 ID |
-| `PAPERLENS_RERANKER_MODE` | `off` | Agent 检索是否使用本地 CrossEncoder 重排 |
+| `PAPERLENS_RERANKER_MODE` | `local` | 默认使用本地 CrossEncoder 高质量重排；工具可为快速探索临时选择 `fast` |
 | `RESEARCH_AGENT_DATA_DIR` | `./data/runtime` | SQLite 与运行时数据目录 |
-| `RESEARCH_AGENT_MAX_MODEL_CALLS` | `20` | 每轮模型调用硬上限 |
-| `RESEARCH_AGENT_MAX_LOCAL_SEARCHES` | `4` | 每轮论文检索硬上限 |
-| `RESEARCH_AGENT_MAX_LOCAL_SOURCES` | `10` | 每轮本地论文证据上限 |
-| `RESEARCH_AGENT_MAX_WEB_SEARCHES` | `6` | 每轮网页搜索硬上限 |
-| `RESEARCH_AGENT_MAX_WEB_FETCHES` | `8` | 每轮网页正文抓取硬上限 |
+| `RESEARCH_AGENT_MAX_MODEL_CALLS` | `40` | 异常循环保护用的模型调用高位安全上限，不作为正常研究配额 |
 | `RESEARCH_AGENT_DDGS_TIMEOUT_SECONDS` | `20` | 单次 DDGS 外层超时 |
-| `PAPERLENS_TIMEOUT_SECONDS` | `180` | 单次 PaperLens 请求超时 |
-| `RESEARCH_AGENT_EVIDENCE_TIMEOUT_SECONDS` | `180` | 每轮证据阶段时间预算 |
-| `RESEARCH_AGENT_RUN_TIMEOUT_SECONDS` | `300` | 整个研究任务时间预算 |
+| `PAPERLENS_TIMEOUT_SECONDS` | `300` | 单次 PaperLens 请求超时，覆盖嵌入与重排模型冷启动 |
+| `RESEARCH_AGENT_EVIDENCE_TIMEOUT_SECONDS` | `360` | 每轮自适应证据研究的时间预算 |
+| `RESEARCH_AGENT_RUN_TIMEOUT_SECONDS` | `600` | 整个研究任务时间预算，预留写作、审查与修订时间 |
 
 `.env`、运行时数据库、前端构建产物和依赖目录均已加入 `.gitignore`，不会随代码提交。
 
@@ -257,9 +258,10 @@ queued | running | completed | failed | cancelled | interrupted
 - Agent 使用状态型虚拟文件后端，不开放真实文件写入和 Shell 工具。
 - 网页工具只允许 HTTP/HTTPS，并阻止 localhost、私网、回环和保留地址。
 - 每次重定向都会重新验证目标地址，同时限制重定向次数、响应大小、内容类型和请求时间。
-- PaperLens 请求采用任务级熔断，首次连接失败后不会通过更换关键词反复重试。
+- PaperLens 连续失败两次后本轮熔断，允许 Agent 对单次瞬时故障做有限判断。
 - DDGS 连续失败两次后，本轮网页搜索熔断。
-- 论文检索在任务内串行执行，并在达到证据上限后停止排队请求。
+- 论文检索在任务内串行执行；人物照片、无内容短标题、无关作者简介和参考文献条目会在持久化前过滤。
+- 对论文整体讲解，累计证据覆盖核心问题、方法、实验和结论后即停止；其他问题由覆盖评估 Agent 按用户意图判断。
 - 最终回答只能引用本轮已持久化的来源 ID；未知引用会被确定性校验移除。
 - 同一会话同时只允许一个活跃研究任务。
 

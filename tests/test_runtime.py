@@ -5,7 +5,7 @@ import httpx
 import pytest
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from research_agent.agent.runtime import AgentRuntime, question_requires_external_web
+from research_agent.agent.runtime import AgentRuntime, _answer_guidance
 from research_agent.config import load_settings
 from research_agent.db import Database
 from research_agent.services.paperlens import PaperLensClient
@@ -30,17 +30,13 @@ async def test_deepagents_runtime_compiles_with_sqlite_checkpointer(tmp_path: Pa
             runtime = AgentRuntime(settings, database, paperlens, web, checkpointer)
             assert runtime.available is True
             assert runtime.main_agent is not None
+            assert runtime.coverage_agent is not None
+            assert runtime.writer_agent is not None
             assert runtime.critic_agent is not None
 
 
-@pytest.mark.parametrize(
-    ("question", "expected"),
-    [
-        ("介绍这篇论文，以及它解决了领域中的什么问题", False),
-        ("结合最新研究进展评价这篇论文", True),
-        ("Compare with other recent studies", True),
-        ("总结论文的实验结果", False),
-    ],
-)
-def test_external_web_routing(question: str, expected: bool) -> None:
-    assert question_requires_external_web(question) is expected
+def test_paper_explanation_gets_teaching_structure() -> None:
+    guidance = _answer_guidance("先给我讲解一下这篇论文", ["paper-1"])
+    assert "核心问题" in guidance
+    assert "方法机制" in guidance
+    assert "实验" in guidance

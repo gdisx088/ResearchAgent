@@ -11,6 +11,7 @@ async def test_paperlens_client_sends_workspace_and_normalizes_evidence() -> Non
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["X-Workspace-Id"] == "workspace-a"
         assert request.url.path == "/api/v1/agent/evidence-search"
+        assert __import__("json").loads(request.content)["reranker_mode"] == "local"
         return httpx.Response(200, json={"evidence": [{
             "citation_id": "doc-a:b1", "document_id": "doc-a", "document_title": "Paper A",
             "block_id": "b1", "excerpt": "Grounded text", "section": "Methods", "page": 2,

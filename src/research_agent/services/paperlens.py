@@ -19,8 +19,8 @@ class PaperLensClient:
         client: httpx.AsyncClient,
         base_url: str,
         workspace_id: str,
-        evidence_timeout_seconds: float = 180,
-        reranker_mode: str = "off",
+        evidence_timeout_seconds: float = 300,
+        reranker_mode: str = "local",
     ) -> None:
         self.client = client
         self.base_url = base_url.rstrip("/")
@@ -89,6 +89,7 @@ class PaperLensClient:
         document_ids: list[str],
         *,
         top_k: int = 8,
+        reranker_mode: str | None = None,
     ) -> dict[str, Any]:
         # PaperLens uses local embedding/reranking models. Serialize evidence calls so
         # parallel subagents cannot overload that synchronous inference path.
@@ -100,7 +101,7 @@ class PaperLensClient:
                     "query": query,
                     "document_ids": document_ids,
                     "top_k": top_k,
-                    "reranker_mode": self.reranker_mode,
+                    "reranker_mode": reranker_mode or self.reranker_mode,
                 },
                 timeout=self.evidence_timeout_seconds,
             )
