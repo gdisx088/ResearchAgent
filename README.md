@@ -300,7 +300,3 @@ python scripts/check_environment.py
 - [Research-Paper-RAG](https://github.com/gdisx088/Research-Paper-RAG)：本项目使用的独立 PaperLens 论文解析与证据服务。
 
 ResearchAgent 是在上述思路基础上的独立实现，重点补充了本地论文页码证据、来源路由、持久化 SSE、引用审查和工具安全边界。
-
-## License
-
-当前仓库尚未指定开源许可证。公开发布或接受外部贡献前，建议根据项目使用方式补充 `LICENSE` 文件。
