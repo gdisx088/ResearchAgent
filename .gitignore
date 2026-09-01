@@ -1,0 +1,13 @@
+.env
+.idea/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+htmlcov/
+data/
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+
